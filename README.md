@@ -56,7 +56,13 @@ But this time I am not responsible for anything that happens to your files, devi
 software, you understand this and accept the risks if any. No software is bullet-proof.
 
 This app uses:
-https://libimobiledevice.org/
-
+```https://libimobiledevice.org/```
 All credits to each dev involved in the creation/maintainance of libimobiledevice.
 
+And thanks to:
+```https://github.com/jrjr/libimobiledevice-windows```
+For porting it to Windows.
+
+And thanks to:
+```https://github.com/emonti/afcclient```
+For modding afcclient to support ```-r, --root Use the afc2 server if jailbroken```
