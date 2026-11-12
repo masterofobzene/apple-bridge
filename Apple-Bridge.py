@@ -2,6 +2,7 @@ import os
 import io
 import re
 import json
+import hashlib
 import subprocess
 import tempfile
 from collections import OrderedDict
@@ -33,7 +34,7 @@ except Exception:
     HAVE_PIL = False
 
 # Paths and constants
-BIN_DIR = r".\libimobile-suite-latest_w64"
+BIN_DIR = r"E:\STORAGE\PROGRAMAS\PORTABLES\apple-bridge\libimobile-suite-latest_w64"
 IDEVICE_ID = os.path.join(BIN_DIR, "idevice_id.exe")
 REMOTE_DIR = "/var/mobile/Media/DCIM/100APPLE"
 UPLOAD_DIR = "/var/mobile/Media/DCIM/100APPLE"
@@ -43,6 +44,7 @@ PREVIEW_SIZE = (400, 400)
 PREVIEW_CACHE_MAX = 30
 IMG_PREVIEW_LIMIT = 100 * 1024 * 1024
 VID_PREVIEW_LIMIT = 400 * 1024 * 1024
+QUICK_HASH_BLOCK = 1024 * 1024
 
 PHOTO_EXTS = ('.jpg', '.jpeg', '.png', '.heic', '.heif', '.gif', '.bmp',
               '.tif', '.tiff', '.webp')
@@ -60,7 +62,19 @@ except Exception:
     RESAMPLE = Image.LANCZOS
 
 
-# --------------------------------------------------------------------------- media helpers
+def _app_data_dir():
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        base = os.getcwd()
+    d = os.path.join(base, 'Data')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+INDEX_PATH = os.path.join(_app_data_dir(), 'upload_index.json')
+
+
+# --------------------------------------------------------------------------- helpers
 def clean_drop_path(p):
     p = p.strip().strip('"').strip("'")
     if p.startswith('file://'):
@@ -71,8 +85,133 @@ def clean_drop_path(p):
     return p
 
 
+_WIN_ILLEGAL = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WIN_RESERVED = re.compile(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$', re.I)
+
+
+def _safe_str(s):
+    try:
+        return str(s).encode('utf-8', 'replace').decode('utf-8')
+    except Exception:
+        return repr(s)
+
+
+def validate_remote_name(name):
+    if not name or name in ('.', '..'):
+        return False, "empty/reserved"
+    if '/' in name or '\x00' in name:
+        return False, "contains '/' or NUL"
+    try:
+        name.encode('utf-8')
+    except UnicodeEncodeError:
+        return False, "invalid UTF-8 (surrogates)"
+    return True, "OK"
+
+
+def safe_local_name(name, max_len=180):
+    if not name or name in ('.', '..'):
+        return "_unnamed_"
+    name = _safe_str(name)
+    name = _WIN_ILLEGAL.sub('_', name)
+    name = name.rstrip(' .') or '_'
+    stem, ext = os.path.splitext(name)
+    if _WIN_RESERVED.match(stem):
+        stem = '_' + stem
+    ext = ext[:16]
+    if len(stem) + len(ext) > max_len:
+        stem = stem[:max_len - len(ext)]
+    return stem + ext
+
+
+def unique_local_path(out_dir, name):
+    base, ext = os.path.splitext(name)
+    candidate = name
+    n = 1
+    while os.path.exists(os.path.join(out_dir, candidate)):
+        n += 1
+        candidate = f"{base}_{n}{ext}"
+    return os.path.join(out_dir, candidate)
+
+
+def _parse_drop(data, tk_root):
+    try:
+        return list(tk_root.tk.splitlist(data))
+    except Exception:
+        out, buf, in_brace = [], '', False
+        for ch in data:
+            if ch == '{':
+                in_brace = True; continue
+            if ch == '}':
+                in_brace = False; continue
+            if ch == ' ' and not in_brace:
+                if buf:
+                    out.append(buf); buf = ''
+                continue
+            buf += ch
+        if buf:
+            out.append(buf)
+        return out or [data]
+
+
+def quick_hash(path, block=QUICK_HASH_BLOCK):
+    """Fast identity hash: SHA256 of (size + first block + last block)."""
+    size = os.path.getsize(path)
+    h = hashlib.sha256()
+    h.update(str(size).encode('ascii'))
+    with open(path, 'rb') as f:
+        if size <= block * 2:
+            h.update(f.read())
+        else:
+            h.update(f.read(block))
+            f.seek(-block, 2)
+            h.update(f.read(block))
+    return h.hexdigest()
+
+
+class UploadIndex:
+    """Persistent map: content-hash -> remote filename (JSON on disk)."""
+    def __init__(self, path):
+        self.path = path
+        self.data = self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+                if isinstance(d, dict) and isinstance(d.get('by_hash'), dict):
+                    return d
+        except Exception:
+            pass
+        return {'by_hash': {}}
+
+    def save(self):
+        tmp = self.path + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)
+        except Exception:
+            try: os.unlink(tmp)
+            except Exception: pass
+
+    def lookup(self, content_hash, remote_set):
+        rec = self.data['by_hash'].get(content_hash)
+        if not rec:
+            return None
+        rn = rec.get('remote_name')
+        return rn if rn and rn in remote_set else None
+
+    def add(self, content_hash, remote_name, size, reencoded):
+        self.data['by_hash'][content_hash] = {
+            'remote_name': remote_name,
+            'size': size,
+            'reencoded': bool(reencoded),
+            'uploaded_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        self.save()
+
+
 def prepare_image(path):
-    """Return (bytes, extension) in a format iOS 6 Photos can display."""
     ext = os.path.splitext(path)[1].lower()
     if ext in ('.jpg', '.jpeg'):
         with open(path, 'rb') as f:
@@ -192,7 +331,7 @@ def extract_video_frame(src_path, thumb_path, size=(400, 400)):
 class MediaLoaderApp:
     def __init__(self, root):
         self.root = root
-        root.title("Apple-Bridge iOS Media Loader")
+        root.title("iOS Media Loader (AFC2 + USB SSH + FFmpeg)")
         root.geometry("1150x720")
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -203,6 +342,7 @@ class MediaLoaderApp:
         self.preview_token = 0
         self.preview_after = None
         self.preview_photo = None
+        self.upload_index = UploadIndex(INDEX_PATH)
 
         self.start_usb_forwarder()
 
@@ -247,7 +387,7 @@ class MediaLoaderApp:
             for w in (self.tree, self.preview_label):
                 w.drop_target_register(DND_FILES)
                 w.dnd_bind('<<Drop>>', self.on_drop)
-            root.title("Apple-Bridge iOS Media Loader")
+            root.title("iOS Media Loader (AFC2 + USB SSH + FFmpeg) - drag & drop enabled")
 
         self.tree.bind("<Control-a>", self.select_all)
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
@@ -259,6 +399,7 @@ class MediaLoaderApp:
         ttk.Button(bottom, text="Upload Files", command=self.upload_files).pack(side="left", padx=6)
         ttk.Button(bottom, text="Delete Selected", command=self.delete_selected).pack(side="left", padx=6)
         ttk.Button(bottom, text="Reboot", command=self.manual_rebuild).pack(side="left", padx=6)
+        ttk.Button(bottom, text="Clear Dedup Index", command=self.clear_dedup_index).pack(side="left", padx=6)
 
         self.log_text = tk.Text(root, height=8, state='disabled', bg="#1e1e1e", fg="#00ff00")
         self.log_text.pack(fill="x", padx=8, pady=(0, 8))
@@ -289,7 +430,7 @@ class MediaLoaderApp:
         return "break"
 
     def log(self, msg):
-        self.log_queue.put(msg)
+        self.log_queue.put(_safe_str(msg))
 
     def _poll_log_queue(self):
         while not self.log_queue.empty():
@@ -322,16 +463,18 @@ class MediaLoaderApp:
 
     # ------------------------------------------------------------------ Drag & drop
     def on_drop(self, event):
-        try:
-            raw = self.root.tk.splitlist(event.data)
-        except Exception:
-            raw = [event.data]
-
+        raw = _parse_drop(event.data, self.root)
         files = []
         for p in raw:
             p = clean_drop_path(p)
             if os.path.isfile(p) and os.path.splitext(p)[1].lower() in ALL_EXTS:
                 files.append(p)
+            elif os.path.isdir(p):
+                for root_dir, _, names in os.walk(p):
+                    for n in names:
+                        fp = os.path.join(root_dir, n)
+                        if os.path.splitext(n)[1].lower() in ALL_EXTS:
+                            files.append(fp)
 
         if not files:
             self.log("Drop ignored: no supported image/video files.")
@@ -361,7 +504,7 @@ class MediaLoaderApp:
 
     def _list_thread(self, udid):
         async def async_list():
-            photos = videos = 0
+            photos = videos = skipped = 0
             try:
                 lockdown = await create_using_usbmux(serial=udid)
                 async with AfcService(lockdown=lockdown, service_name='com.apple.afc2') as afc:
@@ -379,7 +522,13 @@ class MediaLoaderApp:
                             kind = "Video"; videos += 1
                         else:
                             continue
-                        self.root.after(0, lambda n=f, k=kind:
+                        ok, why = validate_remote_name(f)
+                        if not ok:
+                            skipped += 1
+                            self.log(f"Skipping unreadable name ({why}): {_safe_str(f)!r}")
+                            continue
+                        safe = _safe_str(f)
+                        self.root.after(0, lambda n=safe, k=kind:
                                         self.tree.insert("", "end", values=(n, k)))
             except Exception as e:
                 self.log(f"Connection error: {e}")
@@ -388,6 +537,8 @@ class MediaLoaderApp:
                 self.log(f"No media found in {REMOTE_DIR}.")
             else:
                 self.log(f"Loaded {photos} image(s), {videos} video(s).")
+            if skipped:
+                self.log(f"Skipped {skipped} file(s) with unusable names.")
         asyncio.run(async_list())
 
     # ------------------------------------------------------------------ Preview
@@ -429,6 +580,12 @@ class MediaLoaderApp:
                          args=(udid, name, token), daemon=True).start()
 
     def _preview_thread(self, udid, name, token):
+        ok, why = validate_remote_name(name)
+        if not ok:
+            self.root.after(0, lambda: self._preview_failed(
+                name, token, f"invalid name ({why})"))
+            return
+
         ext = os.path.splitext(name)[1].lower()
         is_video = ext in VIDEO_EXTS
         limit = VID_PREVIEW_LIMIT if is_video else IMG_PREVIEW_LIMIT
@@ -463,7 +620,7 @@ class MediaLoaderApp:
                 img, info = self._make_image_preview(data, size_mb)
             self.root.after(0, lambda: self._preview_done(name, token, img, info))
         except Exception as e:
-            msg = str(e)
+            msg = _safe_str(e)
             self.root.after(0, lambda: self._preview_failed(name, token, msg))
 
     def _make_image_preview(self, data, size_mb):
@@ -561,21 +718,27 @@ class MediaLoaderApp:
                 async with AfcService(lockdown=lockdown, service_name='com.apple.afc2') as afc:
                     for i, filename in enumerate(filenames, 1):
                         remote_path = f"{REMOTE_DIR}/{filename}"
-                        local_path = os.path.join(out_dir, filename)
+                        ok, why = validate_remote_name(filename)
+                        if not ok:
+                            self.log(f"[{i}/{len(filenames)}] Skipped invalid name "
+                                     f"({why}): {_safe_str(filename)!r}")
+                            continue
                         try:
                             data = await afc.get_file_contents(remote_path)
+                            local_name = safe_local_name(filename)
+                            local_path = unique_local_path(out_dir, local_name)
                             with open(local_path, 'wb') as f:
                                 f.write(data)
-                            self.log(f"[{i}/{len(filenames)}] Downloaded: {filename} "
-                                     f"({len(data)//1024//1024} MB)")
+                            note = "" if local_name == filename else f" (saved as {local_name})"
+                            self.log(f"[{i}/{len(filenames)}] Downloaded: {_safe_str(filename)} "
+                                     f"({len(data)//1024//1024} MB){note}")
                             success += 1
                         except Exception as e:
-                            self.log(f"[{i}/{len(filenames)}] Failed: {filename} | {e}")
+                            self.log(f"[{i}/{len(filenames)}] Failed: {_safe_str(filename)} | "
+                                     f"{_safe_str(e)}")
             except Exception as e:
-                self.log(f"Connection error: {e}")
+                self.log(f"Connection error: {_safe_str(e)}")
             self.log(f"--- Finished. Downloaded {success}/{len(filenames)} file(s). ---")
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Download Complete", f"Downloaded {success} file(s)."))
         asyncio.run(async_download())
 
     def download_selected(self):
@@ -608,14 +771,20 @@ class MediaLoaderApp:
                 lockdown = await create_using_usbmux(serial=udid)
                 async with AfcService(lockdown=lockdown, service_name='com.apple.afc2') as afc:
                     for i, filename in enumerate(filenames, 1):
+                        ok, why = validate_remote_name(filename)
+                        if not ok:
+                            self.log(f"[{i}/{len(filenames)}] Skipped invalid name "
+                                     f"({why}): {_safe_str(filename)!r}")
+                            continue
                         try:
                             await afc.rm(f"{REMOTE_DIR}/{filename}")
-                            self.log(f"[{i}/{len(filenames)}] Deleted: {filename}")
+                            self.log(f"[{i}/{len(filenames)}] Deleted: {_safe_str(filename)}")
                             success += 1
                         except Exception as e:
-                            self.log(f"[{i}/{len(filenames)}] Failed: {filename} | {e}")
+                            self.log(f"[{i}/{len(filenames)}] Failed: {_safe_str(filename)} | "
+                                     f"{_safe_str(e)}")
             except Exception as e:
-                self.log(f"Connection error: {e}")
+                self.log(f"Connection error: {_safe_str(e)}")
             self.log(f"--- Finished. Deleted {success}/{len(filenames)} file(s). ---")
             self.root.after(0, lambda: messagebox.showinfo(
                 "Delete Complete",
@@ -644,6 +813,7 @@ class MediaLoaderApp:
     def _upload_thread(self, udid, file_paths):
         async def async_upload():
             success = 0
+            skipped_dupes = 0
             afc_ctx = None
             afc = None
 
@@ -667,35 +837,61 @@ class MediaLoaderApp:
                     await a.makedirs(UPLOAD_DIR)
 
                 existing = await a.listdir(UPLOAD_DIR)
+                remote_set = set(existing)
                 nums = [int(m.group(1)) for n in existing
                         for m in [re.match(r"IMG_(\d+)\.", n, re.I)] if m]
                 counter = max(nums, default=0)
+                batch_seen = {}
 
                 for i, local_path in enumerate(file_paths, 1):
                     base = os.path.basename(local_path)
                     ext = os.path.splitext(local_path)[1].lower()
+
+                    try:
+                        src_hash = quick_hash(local_path)
+                    except Exception as e:
+                        self.log(f"[{i}/{len(file_paths)}] Hash failed "
+                                 f"{_safe_str(base)}: {_safe_str(e)}")
+                        continue
+
+                    prev = self.upload_index.lookup(src_hash, remote_set)
+                    if prev:
+                        self.log(f"[{i}/{len(file_paths)}] Skipped (already on device "
+                                 f"as {prev}): {_safe_str(base)}")
+                        skipped_dupes += 1
+                        continue
+
+                    if src_hash in batch_seen:
+                        self.log(f"[{i}/{len(file_paths)}] Skipped (duplicate in batch of "
+                                 f"{batch_seen[src_hash]}): {_safe_str(base)}")
+                        skipped_dupes += 1
+                        continue
+
                     data = None
                     new_ext = None
+                    reencoded = False
                     try:
                         if ext in PHOTO_EXTS:
                             data, new_ext = prepare_image(local_path)
-                            self.log(f"[{i}/{len(file_paths)}] {base}: image ready "
+                            self.log(f"[{i}/{len(file_paths)}] {_safe_str(base)}: image ready "
                                      f"({len(data)//1024} KB)")
                         elif ext in VIDEO_EXTS:
                             try:
                                 probe = probe_video(local_path)
                             except Exception as e:
-                                self.log(f"[{i}/{len(file_paths)}] Probe failed {base}: {e}")
+                                self.log(f"[{i}/{len(file_paths)}] Probe failed "
+                                         f"{_safe_str(base)}: {_safe_str(e)}")
                                 continue
                             playable, reason = check_playable(probe, ext)
                             if playable:
                                 with open(local_path, 'rb') as f:
                                     data = f.read()
                                 new_ext = '.MOV'
-                                self.log(f"[{i}/{len(file_paths)}] {base}: playable as-is "
+                                self.log(f"[{i}/{len(file_paths)}] {_safe_str(base)}: playable as-is "
                                          f"({len(data)//1024//1024} MB)")
                             else:
-                                self.log(f"[{i}/{len(file_paths)}] {base}: {reason} -> re-encoding...")
+                                self.log(f"[{i}/{len(file_paths)}] {_safe_str(base)}: {reason} "
+                                         f"-> re-encoding...")
                                 await close_afc()
                                 tmp = tempfile.NamedTemporaryFile(suffix='.MOV', delete=False)
                                 tmp_path = tmp.name; tmp.close()
@@ -705,38 +901,56 @@ class MediaLoaderApp:
                                     with open(tmp_path, 'rb') as f:
                                         data = f.read()
                                     new_ext = '.MOV'
-                                    self.log(f"[{i}/{len(file_paths)}] {base}: re-encoded to "
+                                    reencoded = True
+                                    self.log(f"[{i}/{len(file_paths)}] {_safe_str(base)}: re-encoded to "
                                              f"{len(data)//1024//1024} MB")
                                 finally:
                                     try: os.unlink(tmp_path)
                                     except Exception: pass
                                 a = await open_afc()
                         else:
-                            self.log(f"[{i}/{len(file_paths)}] Skipped (unsupported): {base}")
+                            self.log(f"[{i}/{len(file_paths)}] Skipped (unsupported): "
+                                     f"{_safe_str(base)}")
                             continue
 
                         counter += 1
                         new_name = f"IMG_{counter:04d}{new_ext}"
                         await a.set_file_contents(f"{UPLOAD_DIR}/{new_name}", data)
-                        self.log(f"[{i}/{len(file_paths)}] Uploaded {base} as {new_name}")
+                        self.log(f"[{i}/{len(file_paths)}] Uploaded {_safe_str(base)} as {new_name}")
                         success += 1
+                        batch_seen[src_hash] = new_name
+                        remote_set.add(new_name)
+                        self.upload_index.add(src_hash, new_name, len(data), reencoded)
                     except Exception as e:
-                        self.log(f"[{i}/{len(file_paths)}] Failed {base}: {e}")
+                        self.log(f"[{i}/{len(file_paths)}] Failed {_safe_str(base)}: "
+                                 f"{_safe_str(e)}")
                         try:
                             await close_afc(); a = await open_afc()
                         except Exception:
                             pass
 
-                self.log(f"--- Finished. Uploaded {success}/{len(file_paths)} file(s). ---")
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Upload Complete",
-                    f"Uploaded {success} file(s).\n\nPress 'Reboot' to apply changes."))
+                self.log(f"--- Finished. Uploaded {success}/{len(file_paths)} file(s), "
+                         f"skipped {skipped_dupes} duplicate(s). ---")
             except Exception as e:
-                self.log(f"Upload error: {e}")
+                self.log(f"Upload error: {_safe_str(e)}")
             finally:
                 await close_afc()
 
         asyncio.run(async_upload())
+
+    def clear_dedup_index(self):
+        if not messagebox.askyesno(
+                "Clear Dedup Index",
+                "Forget all previously uploaded files?\n"
+                "Next upload will re-upload even if already on device."):
+            return
+        try:
+            if os.path.exists(INDEX_PATH):
+                os.unlink(INDEX_PATH)
+            self.upload_index = UploadIndex(INDEX_PATH)
+            self.log("Dedup index cleared.")
+        except Exception as e:
+            self.log(f"Failed to clear index: {_safe_str(e)}")
 
     # ------------------------------------------------------------------ SSH & Rebuild
     def ssh_run(self, ssh, cmd, timeout=60):
@@ -799,7 +1013,7 @@ class MediaLoaderApp:
             ssh.close()
             return True
         except Exception as e:
-            self.log(f"SSH Error: {e}")
+            self.log(f"SSH Error: {_safe_str(e)}")
             return False
 
 
